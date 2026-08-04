@@ -1,12 +1,9 @@
-function randomMs(minMs, maxMs) {
-    return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs
-}
+const { randomMs, clearTimer, pulseControl } = require('./botUtils')
 
 function setupLeaveRejoin(bot, createBot) {
     // Timers
     let leaveTimer = null
     let jumpTimer = null
-    let jumpOffTimer = null
     let reconnectTimer = null
 
     // State
@@ -24,20 +21,15 @@ function setupLeaveRejoin(bot, createBot) {
 
     function cleanup() {
         stopped = true
-        if (leaveTimer) clearTimeout(leaveTimer)
-        if (jumpTimer) clearTimeout(jumpTimer)
-        if (jumpOffTimer) clearTimeout(jumpOffTimer)
-        if (reconnectTimer) clearTimeout(reconnectTimer)
-        leaveTimer = jumpTimer = jumpOffTimer = reconnectTimer = null
+        leaveTimer = clearTimer(leaveTimer)
+        jumpTimer = clearTimer(jumpTimer)
+        reconnectTimer = clearTimer(reconnectTimer)
     }
 
     function scheduleNextJump() {
         if (stopped || !bot.entity) return
 
-        bot.setControlState('jump', true)
-        jumpOffTimer = setTimeout(() => {
-            bot.setControlState('jump', false)
-        }, 300)
+        pulseControl(bot, 'jump', 300)
 
         // random jump 20s -> 5m
         const nextJump = randomMs(20000, 5 * 60 * 1000)
