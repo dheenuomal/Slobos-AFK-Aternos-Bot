@@ -2,7 +2,7 @@
   "name": "AFK Bot",
   "bot-account": {
     "username": "Slobot00",
-    "password": "",
+    "_password": "Set the BOT_ACCOUNT_PASSWORD environment variable instead - this file is committed to git.",
     "type": "offline"
   },
   "server": {
@@ -20,7 +20,7 @@
   "utils": {
     "auto-auth": {
       "enabled": true,
-      "password": "chalol78"
+      "_password": "Set the AUTO_AUTH_PASSWORD environment variable instead - this file is committed to git."
     },
     "anti-afk": {
       "enabled": true,
@@ -74,7 +74,7 @@
   },
   "discord": {
     "enabled": false,
-    "webhookUrl": "YOUR_DISCORD_WEBHOOK_URL_HERE",
+    "_webhookUrl": "Set the DISCORD_WEBHOOK_URL environment variable instead - this file is committed to git.",
     "events": {
       "connect": true,
       "disconnect": true,

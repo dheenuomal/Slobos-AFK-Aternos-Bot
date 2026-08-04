@@ -8,13 +8,35 @@ const config = require("./settings.json");
 const express = require("express");
 const http = require("http");
 const https = require("https");
+const secrets = require("./secrets");
+const {
+  clearedCookie,
+  isAuthenticated,
+  rateLimiter,
+  requireAuth,
+  requireSameOrigin,
+  sessionCookie,
+  timingSafeEqual,
+} = require("./auth");
 
 // ============================================================
 // EXPRESS SERVER - Keep Render/Aternos alive
 // ============================================================
 const app = express();
-app.use(express.json());
+app.set("trust proxy", true);
+app.disable("x-powered-by");
+app.use(express.json({ limit: "16kb" }));
 const PORT = process.env.PORT || 5000;
+
+const controlLimiter = rateLimiter({ windowMs: 60 * 1000, max: 60 });
+const loginLimiter = rateLimiter({ windowMs: 10 * 60 * 1000, max: 10 });
+const MAX_COMMAND_LENGTH = 256;
+
+if (!secrets.dashboardToken) {
+  console.log(
+    "[Security] DASHBOARD_TOKEN is not set - the dashboard is read-only and /start, /stop and /command are disabled.",
+  );
+}
 
 // Bot state tracking
 let botState = {
@@ -27,7 +49,7 @@ let botState = {
 };
 
 // Health check endpoint for monitoring
-app.get('/', (req, res) => {
+app.get("/", (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html lang="en">
@@ -243,19 +265,19 @@ app.get('/', (req, res) => {
             }
           }
 
-          async function startBot() {
-            const r = await fetch('/start', { method: 'POST' });
+          async function control(path, okMessage) {
+            const r = await fetch(path, { method: 'POST' });
+            if (r.status === 401) {
+              window.location.href = '/login';
+              return;
+            }
             const data = await r.json();
-            alert(data.success ? 'Bot started!' : data.msg);
+            alert(data.success ? okMessage : data.msg);
             update();
           }
 
-          async function stopBot() {
-            const r = await fetch('/stop', { method: 'POST' });
-            const data = await r.json();
-            alert(data.success ? 'Bot stopped!' : data.msg);
-            update();
-          }
+          function startBot() { control('/start', 'Bot started!'); }
+          function stopBot() { control('/stop', 'Bot stopped!'); }
 
           setInterval(update, 5000);
           update();
@@ -477,10 +499,12 @@ app.get("/health", (req, res) => {
 app.get("/ping", (req, res) => res.send("pong"));
 
 app.get("/logs", (req, res) => {
+  if (!isAuthenticated(req)) return res.redirect("/login");
+
   const logs = getLogs();
 
   const escapeHTML = (str) =>
-    str.replace(
+    String(str).replace(
       /[&<>"']/g,
       (m) =>
         ({
@@ -930,7 +954,13 @@ app.get("/logs", (req, res) => {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ command: cmd })
               })
-              .then(function(r) { return r.json(); })
+              .then(function(r) {
+                if (r.status === 401) {
+                  window.location.href = '/login';
+                  return { msg: '' };
+                }
+                return r.json();
+              })
               .then(function(data) {
                 if (data.msg) {
                   data.msg.split('\\n').forEach(function(line) {
@@ -975,86 +1005,192 @@ app.get("/logs", (req, res) => {
 
 let botRunning = true;
 
-app.post("/start", (req, res) => {
-  if (botRunning) return res.json({ success: false, msg: "Already running" });
+app.post(
+  "/start",
+  controlLimiter,
+  requireSameOrigin,
+  requireAuth,
+  (req, res) => {
+    if (botRunning) return res.json({ success: false, msg: "Already running" });
 
-  botRunning = true;
-  createBot();
-  addLog("[Control] Bot started");
+    botRunning = true;
+    createBot();
+    addLog("[Control] Bot started");
 
-  res.json({ success: true });
+    res.json({ success: true });
+  },
+);
+
+app.post(
+  "/stop",
+  controlLimiter,
+  requireSameOrigin,
+  requireAuth,
+  (req, res) => {
+    if (!botRunning)
+      return res.json({ success: false, msg: "Already stopped" });
+
+    botRunning = false;
+
+    if (bot) {
+      bot.end();
+      bot = null;
+    }
+
+    clearAllIntervals();
+    addLog("[Control] Bot stopped");
+
+    res.json({ success: true });
+  },
+);
+
+app.post(
+  "/command",
+  controlLimiter,
+  requireSameOrigin,
+  requireAuth,
+  (req, res) => {
+    const raw =
+      req.body && typeof req.body.command === "string" ? req.body.command : "";
+    const cmd = raw.trim();
+    if (!cmd) return res.json({ success: false, msg: "Empty command." });
+
+    if (cmd.length > MAX_COMMAND_LENGTH) {
+      return res.json({
+        success: false,
+        msg: `Command too long (max ${MAX_COMMAND_LENGTH} characters).`,
+      });
+    }
+
+    // Newlines and other control characters let a single request smuggle several
+    // chat lines / commands to the server.
+    if (/[\u0000-\u001f\u007f]/.test(cmd)) {
+      return res.json({
+        success: false,
+        msg: "Command contains control characters.",
+      });
+    }
+
+    addLog(`[Console] > ${cmd}`);
+
+    if (cmd === "/help") {
+      const lines = [
+        "Available commands:",
+        "  /help          - Show this help message",
+        "  /pos           - Show bot's current coordinates",
+        "  /status        - Show bot connection status",
+        "  /list          - Ask server for player list",
+        "  /say <message> - Send a chat message in-game",
+        "  /<anything>    - Send any Minecraft command directly",
+        "  <text>         - Send plain chat (no slash needed)",
+      ];
+      lines.forEach((l) => addLog(`[Console] ${l}`));
+      return res.json({ success: true, msg: lines.join("\n") });
+    }
+
+    if (cmd === "/pos" || cmd === "/coords") {
+      const pos = bot && bot.entity ? bot.entity.position : null;
+      const msg = pos
+        ? `Position: X=${Math.floor(pos.x)}  Y=${Math.floor(pos.y)}  Z=${Math.floor(pos.z)}`
+        : "Position unavailable (bot not spawned).";
+      addLog(`[Console] ${msg}`);
+      return res.json({ success: true, msg });
+    }
+
+    if (cmd === "/status") {
+      const status = botState.connected ? "Connected" : "Disconnected";
+      const uptime = Math.floor((Date.now() - botState.startTime) / 1000);
+      const msg = `Status: ${status} | Uptime: ${uptime}s | Reconnects: ${botState.reconnectAttempts}`;
+      addLog(`[Console] ${msg}`);
+      return res.json({ success: true, msg });
+    }
+
+    if (!bot || typeof bot.chat !== "function") {
+      const msg = bot
+        ? "Bot is still connecting — try again in a moment."
+        : "Bot is not running.";
+      addLog(`[Console] ${msg}`);
+      return res.json({ success: false, msg });
+    }
+
+    try {
+      bot.chat(cmd);
+      addLog(`[Console] Sent to server: ${cmd}`);
+      return res.json({ success: true, msg: `Sent: ${cmd}` });
+    } catch (err) {
+      addLog(`[Console] Error: ${err.message}`);
+      return res.json({ success: false, msg: err.message });
+    }
+  },
+);
+
+// ============================================================
+// DASHBOARD AUTHENTICATION
+// ============================================================
+app.get("/login", (req, res) => {
+  const configured = Boolean(secrets.dashboardToken);
+  res.send(`
+    <!DOCTYPE html>
+    <html lang="en">
+      <head>
+        <title>Sign in</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+          body { font-family: -apple-system, sans-serif; background: #0d1117; color: #e6edf3;
+                 display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+          form { background: #161b22; border: 1px solid #21262d; border-radius: 12px; padding: 28px; width: 320px; }
+          h1 { font-size: 18px; margin: 0 0 16px; }
+          input { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #30363d;
+                  background: #0d1117; color: #e6edf3; margin-bottom: 12px; }
+          button { width: 100%; padding: 10px; border: 0; border-radius: 8px; background: #238636;
+                   color: #fff; font-weight: 600; cursor: pointer; }
+          p { font-size: 13px; color: #8b949e; }
+        </style>
+      </head>
+      <body>
+        <form method="POST" action="/login">
+          <h1>Dashboard sign in</h1>
+          ${
+            configured
+              ? '<input type="password" name="token" placeholder="Dashboard token" autofocus>' +
+                '<button type="submit">Sign in</button>'
+              : "<p>No DASHBOARD_TOKEN is configured, so the controls are disabled. Set it in your environment and restart the bot.</p>"
+          }
+        </form>
+      </body>
+    </html>
+  `);
 });
 
-app.post("/stop", (req, res) => {
-  if (!botRunning) return res.json({ success: false, msg: "Already stopped" });
+app.post(
+  "/login",
+  loginLimiter,
+  requireSameOrigin,
+  express.urlencoded({ extended: false, limit: "1kb" }),
+  (req, res) => {
+    const token =
+      req.body && typeof req.body.token === "string"
+        ? req.body.token.trim()
+        : "";
 
-  botRunning = false;
+    if (
+      !secrets.dashboardToken ||
+      !token ||
+      !timingSafeEqual(token, secrets.dashboardToken)
+    ) {
+      addLog("[Security] Failed dashboard login attempt");
+      return res.redirect("/login");
+    }
 
-  if (bot) {
-    bot.end();
-    bot = null;
-  }
+    res.setHeader("Set-Cookie", sessionCookie(req, token));
+    return res.redirect("/logs");
+  },
+);
 
-  clearAllIntervals();
-  addLog("[Control] Bot stopped");
-
-  res.json({ success: true });
-});
-
-app.post("/command", express.json(), (req, res) => {
-  const cmd = (req.body.command || "").trim();
-  if (!cmd) return res.json({ success: false, msg: "Empty command." });
-
-  addLog(`[Console] > ${cmd}`);
-
-  if (cmd === "/help") {
-    const lines = [
-      "Available commands:",
-      "  /help          - Show this help message",
-      "  /pos           - Show bot's current coordinates",
-      "  /status        - Show bot connection status",
-      "  /list          - Ask server for player list",
-      "  /say <message> - Send a chat message in-game",
-      "  /<anything>    - Send any Minecraft command directly",
-      "  <text>         - Send plain chat (no slash needed)",
-    ];
-    lines.forEach((l) => addLog(`[Console] ${l}`));
-    return res.json({ success: true, msg: lines.join("\n") });
-  }
-
-  if (cmd === "/pos" || cmd === "/coords") {
-    const pos = bot && bot.entity ? bot.entity.position : null;
-    const msg = pos
-      ? `Position: X=${Math.floor(pos.x)}  Y=${Math.floor(pos.y)}  Z=${Math.floor(pos.z)}`
-      : "Position unavailable (bot not spawned).";
-    addLog(`[Console] ${msg}`);
-    return res.json({ success: true, msg });
-  }
-
-  if (cmd === "/status") {
-    const status = botState.connected ? "Connected" : "Disconnected";
-    const uptime = Math.floor((Date.now() - botState.startTime) / 1000);
-    const msg = `Status: ${status} | Uptime: ${uptime}s | Reconnects: ${botState.reconnectAttempts}`;
-    addLog(`[Console] ${msg}`);
-    return res.json({ success: true, msg });
-  }
-
-  if (!bot || typeof bot.chat !== "function") {
-    const msg = bot
-      ? "Bot is still connecting — try again in a moment."
-      : "Bot is not running.";
-    addLog(`[Console] ${msg}`);
-    return res.json({ success: false, msg });
-  }
-
-  try {
-    bot.chat(cmd);
-    addLog(`[Console] Sent to server: ${cmd}`);
-    return res.json({ success: true, msg: `Sent: ${cmd}` });
-  } catch (err) {
-    addLog(`[Console] Error: ${err.message}`);
-    return res.json({ success: false, msg: err.message });
-  }
+app.post("/logout", requireSameOrigin, (req, res) => {
+  res.setHeader("Set-Cookie", clearedCookie());
+  return res.redirect("/login");
 });
 
 // ============================================================
@@ -1214,7 +1350,7 @@ function createBot() {
         : false;
     bot = mineflayer.createBot({
       username: config["bot-account"].username,
-      password: config["bot-account"].password || undefined,
+      password: secrets.botAccountPassword || undefined,
       auth: config["bot-account"].type,
       host: config.server.ip,
       port: config.server.port,
@@ -1399,11 +1535,17 @@ function initializeModules(bot, mcData, defaultMove) {
 
   // ---------- AUTO AUTH (REACTIVE) ----------
   if (config.utils["auto-auth"] && config.utils["auto-auth"].enabled) {
-    const password = config.utils["auto-auth"].password;
+    const password = secrets.autoAuthPassword;
     let authHandled = false;
 
+    if (!password) {
+      addLog(
+        "[Auth] auto-auth is enabled but no password is configured - set AUTO_AUTH_PASSWORD.",
+      );
+    }
+
     const tryAuth = (type) => {
-      if (authHandled || !bot || !botState.connected) return;
+      if (authHandled || !password || !bot || !botState.connected) return;
       authHandled = true;
       if (type === "register") {
         bot.chat(`/register ${password} ${password}`);
@@ -1434,7 +1576,7 @@ function initializeModules(bot, mcData, defaultMove) {
 
     // Failsafe: if no prompt after 10s, try login anyway
     setTimeout(() => {
-      if (!authHandled && bot && botState.connected) {
+      if (!authHandled && password && bot && botState.connected) {
         addLog(
           "[Auth] No prompt detected after 10s, sending /login as failsafe",
         );
@@ -1874,7 +2016,13 @@ function chatModule(bot) {
         }
         if (message.startsWith("!tp ")) {
           const target = message.split(" ")[1];
-          if (target) bot.chat(`/tp ${target}`);
+          // Only accept real Minecraft usernames so chat can't inject
+          // arbitrary command arguments (e.g. "@a" or a selector/coords).
+          if (target && /^[A-Za-z0-9_]{3,16}$/.test(target)) {
+            bot.chat(`/tp ${target}`);
+          } else if (target) {
+            addLog(`[Chat] Ignored !tp with invalid target from ${username}`);
+          }
         }
       }
     } catch (e) {
@@ -1919,13 +2067,8 @@ rl.on("line", (line) => {
 // FIX: rate limiting to avoid spam when bot is flapping
 // ============================================================
 function sendDiscordWebhook(content, color = 0x0099ff) {
-  if (
-    !config.discord ||
-    !config.discord.enabled ||
-    !config.discord.webhookUrl ||
-    config.discord.webhookUrl.includes("YOUR_DISCORD")
-  )
-    return;
+  const webhookUrl = secrets.discordWebhookUrl;
+  if (!config.discord || !config.discord.enabled || !webhookUrl) return;
 
   // FIX: Discord rate limiting - skip if sent too recently
   const now = Date.now();
@@ -1935,8 +2078,18 @@ function sendDiscordWebhook(content, color = 0x0099ff) {
   }
   lastDiscordSend = now;
 
-  const protocol = config.discord.webhookUrl.startsWith("https") ? https : http;
-  const urlParts = new URL(config.discord.webhookUrl);
+  let urlParts;
+  try {
+    urlParts = new URL(webhookUrl);
+  } catch (e) {
+    addLog("[Discord] Invalid webhook URL - skipping");
+    return;
+  }
+
+  if (urlParts.protocol !== "https:") {
+    addLog("[Discord] Refusing to send webhook over plain HTTP");
+    return;
+  }
 
   const payload = JSON.stringify({
     username: config.name,
@@ -1962,7 +2115,7 @@ function sendDiscordWebhook(content, color = 0x0099ff) {
     },
   };
 
-  const req = protocol.request(options, (res) => {
+  const req = https.request(options, (res) => {
     // Silent success
   });
 
@@ -2047,7 +2200,9 @@ process.on("unhandledRejection", (reason) => {
     clearAllIntervals();
     botState.connected = false;
     if (bot) {
-      try { bot.end(); } catch (_) {}
+      try {
+        bot.end();
+      } catch (_) {}
       bot = null;
     }
     scheduleReconnect();
