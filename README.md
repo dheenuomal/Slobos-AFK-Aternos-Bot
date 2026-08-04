@@ -29,9 +29,33 @@ We have made setup super easy! Check out the guide below:
 
 ---
 
+## 🔐 Configuration & Secrets
+
+Secrets live in environment variables, **never** in `settings.json` (that file is committed to git). See [`.env.example`](.env.example).
+
+| Variable | Purpose |
+| --- | --- |
+| `DASHBOARD_TOKEN` | **Required** to use the dashboard controls (`/start`, `/stop`, `/command`) and to view `/logs`. Without it those routes stay disabled. |
+| `AUTO_AUTH_PASSWORD` | In-game `/login` / `/register` password used by auto-auth. |
+| `BOT_ACCOUNT_PASSWORD` | Only for premium (Microsoft) accounts. |
+| `DISCORD_WEBHOOK_URL` | Optional connect/disconnect/chat notifications. |
+
+Generate a dashboard token with:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"
+```
+
+On Render/Replit set these in the Environment/Secrets panel. Locally: `node --env-file=.env index.js`.
+
+Your dashboard is publicly reachable, so anyone who can load it could otherwise run Minecraft commands as your bot — sign in at `/login` with the token before using the controls.
+
+---
+
 ## ⚙️ Usage
 *   **Start**: Just turn on your Aternos server. The bot will join automatically.
 *   **Status**: Visit the Render URL to see a status dashboard.
+*   **Controls/Logs**: Sign in at `/login` with your `DASHBOARD_TOKEN`.
 *   **Chat**: The bot logs chat to the console.
 
 ---
