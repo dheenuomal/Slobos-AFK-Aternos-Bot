@@ -1,6 +1,6 @@
 "use strict";
 
-const { addLog, getLogs } = require("./logger");
+const { addLog, addErrorLog, describeError, getLogs } = require("./logger");
 const mineflayer = require("mineflayer");
 const { Movements, pathfinder, goals } = require("mineflayer-pathfinder");
 const { GoalBlock } = goals;
@@ -25,6 +25,80 @@ let botState = {
   errors: [],
   wasThrottled: false,
 };
+
+// ============================================================
+// ERROR TRACKING HELPERS
+// ============================================================
+const MAX_TRACKED_ERRORS = 100;
+
+function trackError(entry) {
+  botState.errors.push({ ...entry, time: Date.now() });
+  if (botState.errors.length > MAX_TRACKED_ERRORS) {
+    botState.errors = botState.errors.slice(-50);
+  }
+}
+
+// Log an error (with stack when available) and keep it in botState for /health
+function recordError(scope, err, type = "error") {
+  addErrorLog(scope, err);
+  trackError({ type, message: describeError(err) });
+}
+
+// Chat can throw when the connection dies mid-send; never let that be silent
+function safeChat(botInstance, message, scope) {
+  if (!botInstance || typeof botInstance.chat !== "function") {
+    addLog(`${scope} Not sending "${message}" - bot is not ready`);
+    return false;
+  }
+  try {
+    botInstance.chat(message);
+    return true;
+  } catch (err) {
+    recordError(`${scope} Failed to send chat:`, err, "chat");
+    return false;
+  }
+}
+
+// ============================================================
+// CONFIG VALIDATION - fail loudly instead of crashing later
+// ============================================================
+function validateConfig(cfg) {
+  const problems = [];
+
+  if (!cfg || typeof cfg !== "object") {
+    problems.push("settings.json must contain a JSON object");
+  } else {
+    if (!cfg["bot-account"] || !cfg["bot-account"].username) {
+      problems.push('"bot-account.username" is required');
+    }
+    if (!cfg.server || !cfg.server.ip) {
+      problems.push('"server.ip" is required');
+    }
+    if (!cfg.server || !Number.isFinite(Number(cfg.server.port))) {
+      problems.push('"server.port" must be a number');
+    }
+    if (!cfg.utils || typeof cfg.utils !== "object") {
+      problems.push('"utils" section is required');
+    }
+    if (!cfg.modules || typeof cfg.modules !== "object") {
+      problems.push('"modules" section is required');
+    }
+  }
+
+  if (problems.length > 0) {
+    throw new Error(
+      `Invalid settings.json:\n  - ${problems.join("\n  - ")}`,
+    );
+  }
+}
+
+try {
+  validateConfig(config);
+} catch (err) {
+  addErrorLog("[Config]", err);
+  addLog("[Config] Fix settings.json and restart - refusing to start.");
+  process.exit(1);
+}
 
 // Health check endpoint for monitoring
 app.get('/', (req, res) => {
@@ -471,6 +545,7 @@ app.get("/health", (req, res) => {
     lastActivity: botState.lastActivity,
     reconnectAttempts: botState.reconnectAttempts,
     memoryUsage: process.memoryUsage().heapUsed / 1024 / 1024,
+    recentErrors: botState.errors.slice(-10),
   });
 });
 
@@ -979,7 +1054,15 @@ app.post("/start", (req, res) => {
   if (botRunning) return res.json({ success: false, msg: "Already running" });
 
   botRunning = true;
-  createBot();
+  try {
+    createBot();
+  } catch (err) {
+    botRunning = false;
+    recordError("[Control] Failed to start bot:", err, "control");
+    return res
+      .status(500)
+      .json({ success: false, msg: `Failed to start bot: ${describeError(err)}` });
+  }
   addLog("[Control] Bot started");
 
   res.json({ success: true });
@@ -991,10 +1074,15 @@ app.post("/stop", (req, res) => {
   botRunning = false;
 
   if (bot) {
-    bot.end();
+    try {
+      bot.end();
+    } catch (err) {
+      recordError("[Control] Error ending bot:", err, "control");
+    }
     bot = null;
   }
 
+  clearBotTimeouts();
   clearAllIntervals();
   addLog("[Control] Bot stopped");
 
@@ -1047,31 +1135,56 @@ app.post("/command", express.json(), (req, res) => {
     return res.json({ success: false, msg });
   }
 
-  try {
-    bot.chat(cmd);
-    addLog(`[Console] Sent to server: ${cmd}`);
-    return res.json({ success: true, msg: `Sent: ${cmd}` });
-  } catch (err) {
-    addLog(`[Console] Error: ${err.message}`);
-    return res.json({ success: false, msg: err.message });
+  if (!safeChat(bot, cmd, "[Console]")) {
+    return res
+      .status(500)
+      .json({ success: false, msg: "Failed to send command - see logs" });
   }
+
+  addLog(`[Console] Sent to server: ${cmd}`);
+  return res.json({ success: true, msg: `Sent: ${cmd}` });
+});
+
+app.use((req, res) => {
+  res.status(404).json({ success: false, msg: `Unknown endpoint: ${req.path}` });
+});
+
+// Express swallows handler errors into a bare 500 by default; surface them
+app.use((err, req, res, next) => {
+  recordError(`[Server] Request ${req.method} ${req.path} failed:`, err, "http");
+  if (res.headersSent) return next(err);
+  const status = err.status || err.statusCode || 500;
+  res.status(status).json({ success: false, msg: describeError(err) });
 });
 
 // ============================================================
 //                    END OF WEB TOOLS
 //============================================================
 
-// FIX: handle port conflict gracefully - try next port if taken
-const server = app.listen(PORT, "0.0.0.0", () => {
-  addLog(`[Server] HTTP server started on port ${server.address().port} `);
+// Handle port conflicts by walking up the port range, with a hard attempt cap
+// so a busy range cannot turn into an endless retry loop on the same port.
+const MAX_PORT_ATTEMPTS = 10;
+let httpPort = Number(PORT);
+let portAttempts = 0;
+
+const server = app.listen(httpPort, "0.0.0.0", () => {
+  addLog(`[Server] HTTP server started on port ${server.address().port}`);
 });
 server.on("error", (err) => {
+  if (err.code === "EADDRINUSE" && portAttempts < MAX_PORT_ATTEMPTS) {
+    portAttempts++;
+    const busyPort = httpPort;
+    httpPort++;
+    addLog(`[Server] Port ${busyPort} in use - trying port ${httpPort}`);
+    setTimeout(() => server.listen(httpPort, "0.0.0.0"), 250);
+    return;
+  }
+
+  recordError("[Server] HTTP server error:", err, "server");
   if (err.code === "EADDRINUSE") {
-    const fallbackPort = PORT + 1;
-    addLog(`[Server] Port ${PORT} in use - trying port ${fallbackPort} `);
-    server.listen(fallbackPort, "0.0.0.0");
-  } else {
-    addLog(`[Server] HTTP server error: ${err.message} `);
+    addLog(
+      `[Server] No free port after ${MAX_PORT_ATTEMPTS} attempts - dashboard and self-ping are unavailable`,
+    );
   }
 });
 
@@ -1099,13 +1212,18 @@ function startSelfPing() {
   }
   setInterval(() => {
     const protocol = renderUrl.startsWith("https") ? https : http;
-    protocol
-      .get(`${renderUrl}/ping`, (res) => {
-        // Silent success
-      })
-      .on("error", (err) => {
-        addLog(`[KeepAlive] Self-ping failed: ${err.message}`);
-      });
+    const req = protocol.get(`${renderUrl}/ping`, { timeout: 15000 }, (res) => {
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        addLog(`[KeepAlive] Self-ping returned HTTP ${res.statusCode}`);
+      }
+      res.resume(); // drain the response so the socket is released
+    });
+    req.on("timeout", () => {
+      req.destroy(new Error("self-ping request timed out after 15s"));
+    });
+    req.on("error", (err) => {
+      addLog(`[KeepAlive] Self-ping failed: ${describeError(err)}`);
+    });
   }, SELF_PING_INTERVAL);
   addLog("[KeepAlive] Self-ping system started (every 10 min)");
 }
@@ -1196,8 +1314,8 @@ function createBot() {
     try {
       bot.removeAllListeners();
       bot.end();
-    } catch (e) {
-      addLog("[Cleanup] Error ending previous bot:", e.message);
+    } catch (err) {
+      recordError("[Cleanup] Error ending previous bot:", err, "cleanup");
     }
     bot = null;
   }
@@ -1233,8 +1351,12 @@ function createBot() {
         try {
           bot.removeAllListeners();
           bot.end();
-        } catch (e) {
-          /* ignore */
+        } catch (err) {
+          recordError(
+            "[Bot] Error ending timed-out bot:",
+            err,
+            "cleanup",
+          );
         }
         bot = null;
         scheduleReconnect();
@@ -1269,20 +1391,36 @@ function createBot() {
       }
 
       // FIX: use bot.version (auto-detected) instead of config value so minecraft-data always matches
-      const mcData = require("minecraft-data")(bot.version);
-      const defaultMove = new Movements(bot, mcData);
-      defaultMove.allowFreeMotion = false;
-      defaultMove.canDig = false;
-      defaultMove.liquidCost = 1000;
-      defaultMove.fallDamageCost = 1000;
+      try {
+        const mcData = require("minecraft-data")(bot.version);
+        if (!mcData) {
+          throw new Error(
+            `minecraft-data has no data for version "${bot.version}"`,
+          );
+        }
+        const defaultMove = new Movements(bot, mcData);
+        defaultMove.allowFreeMotion = false;
+        defaultMove.canDig = false;
+        defaultMove.liquidCost = 1000;
+        defaultMove.fallDamageCost = 1000;
 
-      initializeModules(bot, mcData, defaultMove);
+        initializeModules(bot, mcData, defaultMove);
+      } catch (err) {
+        // The connection itself is what keeps the server alive, so stay online,
+        // but make the module failure visible instead of dying inside the handler.
+        recordError(
+          "[Modules] Initialization failed - bot stays connected without modules:",
+          err,
+          "modules",
+        );
+      }
 
       // Attempt creative mode (only works if bot has OP and enabled in settings)
       setTimeout(() => {
         if (bot && botState.connected && config.server["try-creative"]) {
-          bot.chat("/gamemode creative");
-          addLog("[INFO] Attempted to set creative mode (requires OP)");
+          if (safeChat(bot, "/gamemode creative", "[INFO]")) {
+            addLog("[INFO] Attempted to set creative mode (requires OP)");
+          }
         }
       }, 3000);
 
@@ -1304,11 +1442,7 @@ function createBot() {
         typeof reason === "object" ? JSON.stringify(reason) : reason;
       addLog(`[Bot] Kicked: ${kickReason}`);
       botState.connected = false;
-      botState.errors.push({
-        type: "kicked",
-        reason: kickReason,
-        time: Date.now(),
-      });
+      trackError({ type: "kicked", reason: kickReason, message: kickReason });
       clearAllIntervals();
 
       const reasonStr = String(kickReason).toLowerCase();
@@ -1356,13 +1490,13 @@ function createBot() {
     });
 
     bot.on("error", (err) => {
-      const msg = err.message || "";
-      addLog(`[Bot] Error: ${msg}`);
-      botState.errors.push({ type: "error", message: msg, time: Date.now() });
+      recordError("[Bot] Error:", err);
       // Don't reconnect on error - let 'end' event handle it
     });
   } catch (err) {
-    addLog(`[Bot] Failed to create bot: ${err.message}`);
+    recordError("[Bot] Failed to create bot:", err, "create");
+    bot = null;
+    clearBotTimeouts();
     scheduleReconnect();
   }
 }
@@ -1406,17 +1540,21 @@ function initializeModules(bot, mcData, defaultMove) {
       if (authHandled || !bot || !botState.connected) return;
       authHandled = true;
       if (type === "register") {
-        bot.chat(`/register ${password} ${password}`);
-        addLog("[Auth] Detected register prompt - sent /register");
-      } else {
-        bot.chat(`/login ${password}`);
+        if (safeChat(bot, `/register ${password} ${password}`, "[Auth]")) {
+          addLog("[Auth] Detected register prompt - sent /register");
+        } else {
+          authHandled = false; // allow a later prompt to retry
+        }
+      } else if (safeChat(bot, `/login ${password}`, "[Auth]")) {
         addLog("[Auth] Detected login prompt - sent /login");
+      } else {
+        authHandled = false;
       }
     };
 
     bot.on("messagestr", (message) => {
       if (authHandled) return;
-      const msg = message.toLowerCase();
+      const msg = String(message).toLowerCase();
       if (
         msg.includes("/register") ||
         msg.includes("register ") ||
@@ -1438,8 +1576,7 @@ function initializeModules(bot, mcData, defaultMove) {
         addLog(
           "[Auth] No prompt detected after 10s, sending /login as failsafe",
         );
-        bot.chat(`/login ${password}`);
-        authHandled = true;
+        authHandled = safeChat(bot, `/login ${password}`, "[Auth]");
       }
     }, 10000);
   }
@@ -1447,11 +1584,15 @@ function initializeModules(bot, mcData, defaultMove) {
   // ---------- CHAT MESSAGES ----------
   if (config.utils["chat-messages"] && config.utils["chat-messages"].enabled) {
     const messages = config.utils["chat-messages"].messages;
-    if (config.utils["chat-messages"].repeat) {
+    if (!Array.isArray(messages) || messages.length === 0) {
+      addLog(
+        '[Chat] "chat-messages" is enabled but no messages are configured - skipping',
+      );
+    } else if (config.utils["chat-messages"].repeat) {
       let i = 0;
       addInterval(() => {
         if (bot && botState.connected) {
-          bot.chat(messages[i]);
+          safeChat(bot, messages[i], "[Chat]");
           botState.lastActivity = Date.now();
           i = (i + 1) % messages.length;
         }
@@ -1459,7 +1600,7 @@ function initializeModules(bot, mcData, defaultMove) {
     } else {
       messages.forEach((msg, idx) => {
         setTimeout(() => {
-          if (bot && botState.connected) bot.chat(msg);
+          if (bot && botState.connected) safeChat(bot, msg, "[Chat]");
         }, idx * 1000);
       });
     }
@@ -1476,11 +1617,15 @@ function initializeModules(bot, mcData, defaultMove) {
       config.movement["circle-walk"].enabled
     )
   ) {
-    bot.pathfinder.setMovements(defaultMove);
-    bot.pathfinder.setGoal(
-      new GoalBlock(config.position.x, config.position.y, config.position.z),
-    );
-    addLog("[Position] Navigating to configured position...");
+    try {
+      bot.pathfinder.setMovements(defaultMove);
+      bot.pathfinder.setGoal(
+        new GoalBlock(config.position.x, config.position.y, config.position.z),
+      );
+      addLog("[Position] Navigating to configured position...");
+    } catch (err) {
+      recordError("[Position] Failed to set goal:", err, "position");
+    }
   }
 
   // ---------- ANTI-AFK ----------
@@ -1491,7 +1636,9 @@ function initializeModules(bot, mcData, defaultMove) {
         if (!bot || !botState.connected) return;
         try {
           bot.swingArm();
-        } catch (e) {}
+        } catch (err) {
+          recordError("[AntiAFK] Swing arm failed:", err, "anti-afk");
+        }
       },
       10000 + Math.floor(Math.random() * 50000),
     );
@@ -1503,7 +1650,9 @@ function initializeModules(bot, mcData, defaultMove) {
         try {
           const slot = Math.floor(Math.random() * 9);
           bot.setQuickBarSlot(slot);
-        } catch (e) {}
+        } catch (err) {
+          recordError("[AntiAFK] Hotbar cycle failed:", err, "anti-afk");
+        }
       },
       30000 + Math.floor(Math.random() * 90000),
     );
@@ -1525,12 +1674,23 @@ function initializeModules(bot, mcData, defaultMove) {
             try {
               bot.setControlState("sneak", true);
               setTimeout(() => {
-                if (bot && typeof bot.setControlState === "function")
-                  bot.setControlState("sneak", false);
+                try {
+                  if (bot && typeof bot.setControlState === "function")
+                    bot.setControlState("sneak", false);
+                } catch (err) {
+                  recordError(
+                    "[AntiAFK] Teabag release failed:",
+                    err,
+                    "anti-afk",
+                  );
+                  return;
+                }
                 count--;
                 setTimeout(doTeabag, 150);
               }, 150);
-            } catch (e) {}
+            } catch (err) {
+              recordError("[AntiAFK] Teabag failed:", err, "anti-afk");
+            }
           };
           doTeabag();
         }
@@ -1560,14 +1720,22 @@ function initializeModules(bot, mcData, defaultMove) {
             bot.setControlState("forward", true);
             setTimeout(
               () => {
-                if (bot && typeof bot.setControlState === "function")
-                  bot.setControlState("forward", false);
+                try {
+                  if (bot && typeof bot.setControlState === "function")
+                    bot.setControlState("forward", false);
+                } catch (err) {
+                  recordError(
+                    "[AntiAFK] Failed to stop walking:",
+                    err,
+                    "anti-afk",
+                  );
+                }
               },
               500 + Math.floor(Math.random() * 1500),
             );
             botState.lastActivity = Date.now();
-          } catch (e) {
-            addLog("[AntiAFK] Walk error:", e.message);
+          } catch (err) {
+            recordError("[AntiAFK] Walk error:", err, "anti-afk");
           }
         },
         120000 + Math.floor(Math.random() * 360000),
@@ -1578,7 +1746,9 @@ function initializeModules(bot, mcData, defaultMove) {
       try {
         if (typeof bot.setControlState === "function")
           bot.setControlState("sneak", true);
-      } catch (e) {}
+      } catch (err) {
+        recordError("[AntiAFK] Failed to enable sneak:", err, "anti-afk");
+      }
     }
   }
 
@@ -1655,8 +1825,8 @@ function startCircleWalk(bot, defaultMove) {
       );
       angle += Math.PI / 4;
       botState.lastActivity = Date.now();
-    } catch (e) {
-      addLog("[CircleWalk] Error:", e.message);
+    } catch (err) {
+      recordError("[CircleWalk] Error:", err, "movement");
     }
   }, config.movement["circle-walk"].speed);
 }
@@ -1672,12 +1842,16 @@ function startRandomJump(bot) {
     try {
       bot.setControlState("jump", true);
       setTimeout(() => {
-        if (bot && typeof bot.setControlState === "function")
-          bot.setControlState("jump", false);
+        try {
+          if (bot && typeof bot.setControlState === "function")
+            bot.setControlState("jump", false);
+        } catch (err) {
+          recordError("[RandomJump] Failed to release jump:", err, "movement");
+        }
       }, 300);
       botState.lastActivity = Date.now();
-    } catch (e) {
-      addLog("[RandomJump] Error:", e.message);
+    } catch (err) {
+      recordError("[RandomJump] Error:", err, "movement");
     }
   }, config.movement["random-jump"].interval);
 }
@@ -1690,8 +1864,8 @@ function startLookAround(bot) {
       const pitch = (Math.random() * Math.PI) / 2 - Math.PI / 4;
       bot.look(yaw, pitch, false);
       botState.lastActivity = Date.now();
-    } catch (e) {
-      addLog("[LookAround] Error:", e.message);
+    } catch (err) {
+      recordError("[LookAround] Error:", err, "movement");
     }
   }, config.movement["look-around"].interval);
 }
@@ -1723,14 +1897,22 @@ function avoidMobs(bot) {
         if (distance < safeDistance) {
           bot.setControlState("back", true);
           setTimeout(() => {
-            if (bot && typeof bot.setControlState === "function")
-              bot.setControlState("back", false);
+            try {
+              if (bot && typeof bot.setControlState === "function")
+                bot.setControlState("back", false);
+            } catch (err) {
+              recordError(
+                "[AvoidMobs] Failed to stop backing up:",
+                err,
+                "avoid-mobs",
+              );
+            }
           }, 500);
           break;
         }
       }
-    } catch (e) {
-      addLog("[AvoidMobs] Error:", e.message);
+    } catch (err) {
+      recordError("[AvoidMobs] Error:", err, "avoid-mobs");
     }
   }, 2000);
 }
@@ -1784,8 +1966,8 @@ function combatModule(bot, mcData) {
         bot.attack(lockedTarget);
         lastAttackTime = now;
       }
-    } catch (e) {
-      addLog("[Combat] Error:", e.message);
+    } catch (err) {
+      recordError("[Combat] Error:", err, "combat");
     }
   });
 
@@ -1801,11 +1983,11 @@ function combatModule(bot, mcData) {
           bot
             .equip(food, "hand")
             .then(() => bot.consume())
-            .catch((e) => addLog("[AutoEat] Error:", e.message));
+            .catch((err) => recordError("[AutoEat] Error:", err, "combat"));
         }
       }
-    } catch (e) {
-      addLog("[AutoEat] Error:", e.message);
+    } catch (err) {
+      recordError("[AutoEat] Error:", err, "combat");
     }
   });
 }
@@ -1836,16 +2018,17 @@ function bedModule(bot, mcData) {
           try {
             await bot.sleep(bedBlock);
             addLog("[Bed] Sleeping...");
-          } catch (e) {
-            // Can't sleep - maybe not night enough or monsters nearby
+          } catch (err) {
+            // Expected in many cases (monsters nearby, not dark enough) - log, don't hide
+            addLog(`[Bed] Could not sleep: ${describeError(err)}`);
           } finally {
             isTryingToSleep = false;
           }
         }
       }
-    } catch (e) {
+    } catch (err) {
       isTryingToSleep = false;
-      addLog("[Bed] Error:", e.message);
+      recordError("[Bed] Error:", err, "beds");
     }
   }, 10000);
 }
@@ -1870,15 +2053,15 @@ function chatModule(bot) {
       if (config.chat && config.chat.respond) {
         const lowerMsg = message.toLowerCase();
         if (lowerMsg.includes("hello") || lowerMsg.includes("hi")) {
-          bot.chat(`Hello, ${username}!`);
+          safeChat(bot, `Hello, ${username}!`, "[Chat]");
         }
         if (message.startsWith("!tp ")) {
           const target = message.split(" ")[1];
-          if (target) bot.chat(`/tp ${target}`);
+          if (target) safeChat(bot, `/tp ${target}`, "[Chat]");
         }
       }
-    } catch (e) {
-      addLog("[Chat] Error:", e.message);
+    } catch (err) {
+      recordError("[Chat] Error:", err, "chat");
     }
   });
 }
@@ -1893,6 +2076,10 @@ const rl = readline.createInterface({
   terminal: false,
 });
 
+rl.on("error", (err) => {
+  recordError("[Console] stdin error:", err, "console");
+});
+
 rl.on("line", (line) => {
   if (!bot || !botState.connected) {
     addLog("[Console] Bot not connected");
@@ -1901,15 +2088,15 @@ rl.on("line", (line) => {
 
   const trimmed = line.trim();
   if (trimmed.startsWith("say ")) {
-    bot.chat(trimmed.slice(4));
+    safeChat(bot, trimmed.slice(4), "[Console]");
   } else if (trimmed.startsWith("cmd ")) {
-    bot.chat("/" + trimmed.slice(4));
+    safeChat(bot, "/" + trimmed.slice(4), "[Console]");
   } else if (trimmed === "status") {
     addLog(
       `Connected: ${botState.connected}, Uptime: ${formatUptime(Math.floor((Date.now() - botState.startTime) / 1000))}`,
     );
-  } else {
-    bot.chat(trimmed);
+  } else if (trimmed) {
+    safeChat(bot, trimmed, "[Console]");
   }
 });
 
@@ -1936,7 +2123,18 @@ function sendDiscordWebhook(content, color = 0x0099ff) {
   lastDiscordSend = now;
 
   const protocol = config.discord.webhookUrl.startsWith("https") ? https : http;
-  const urlParts = new URL(config.discord.webhookUrl);
+
+  let urlParts;
+  try {
+    urlParts = new URL(config.discord.webhookUrl);
+  } catch (err) {
+    recordError(
+      "[Discord] Invalid webhookUrl in settings.json:",
+      err,
+      "discord",
+    );
+    return;
+  }
 
   const payload = JSON.stringify({
     username: config.name,
@@ -1952,7 +2150,7 @@ function sendDiscordWebhook(content, color = 0x0099ff) {
 
   const options = {
     hostname: urlParts.hostname,
-    port: 443,
+    port: urlParts.port || (protocol === https ? 443 : 80),
     path: urlParts.pathname + urlParts.search,
     method: "POST",
     headers: {
@@ -1963,15 +2161,39 @@ function sendDiscordWebhook(content, color = 0x0099ff) {
   };
 
   const req = protocol.request(options, (res) => {
-    // Silent success
+    // Discord answers 204 on success; anything else (401/404/429) must not be silent
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        if (body.length < 500) body += chunk;
+      });
+      res.on("end", () => {
+        addLog(
+          `[Discord] Webhook rejected with HTTP ${res.statusCode}: ${body.trim()}`,
+        );
+      });
+      return;
+    }
+    res.resume(); // drain so the socket is released
   });
 
-  req.on("error", (e) => {
-    addLog(`[Discord] Error sending webhook: ${e.message}`);
+  req.on("timeout", () => {
+    req.destroy(new Error("webhook request timed out after 10s"));
   });
 
-  req.write(payload);
-  req.end();
+  req.on("error", (err) => {
+    addLog(`[Discord] Error sending webhook: ${describeError(err)}`);
+  });
+
+  req.setTimeout(10000);
+
+  try {
+    req.write(payload);
+    req.end();
+  } catch (err) {
+    recordError("[Discord] Failed to send webhook:", err, "discord");
+  }
 }
 
 // ============================================================
@@ -1979,14 +2201,9 @@ function sendDiscordWebhook(content, color = 0x0099ff) {
 // FIX: guard against uncaughtException stacking reconnects when isReconnecting is already true
 // ============================================================
 process.on("uncaughtException", (err) => {
-  const msg = err.message || "Unknown";
-  addLog(`[FATAL] Uncaught Exception: ${msg}`);
-  botState.errors.push({ type: "uncaught", message: msg, time: Date.now() });
-
-  // Cap errors array to prevent memory leak over long uptimes
-  if (botState.errors.length > 100) {
-    botState.errors = botState.errors.slice(-50);
-  }
+  const msg = describeError(err);
+  addErrorLog("[FATAL] Uncaught Exception:", err);
+  trackError({ type: "uncaught", message: msg });
 
   const isNetworkError =
     msg.includes("PartialReadError") ||
@@ -2027,12 +2244,9 @@ process.on("uncaughtException", (err) => {
 });
 
 process.on("unhandledRejection", (reason) => {
-  const msg = String(reason);
-  addLog(`[FATAL] Unhandled Rejection: ${reason}`);
-  botState.errors.push({ type: "rejection", message: msg, time: Date.now() });
-  if (botState.errors.length > 100) {
-    botState.errors = botState.errors.slice(-50);
-  }
+  const msg = describeError(reason);
+  addErrorLog("[FATAL] Unhandled Rejection:", reason);
+  trackError({ type: "rejection", message: msg });
 
   const isNetworkError =
     msg.includes("ETIMEDOUT") ||
@@ -2047,10 +2261,18 @@ process.on("unhandledRejection", (reason) => {
     clearAllIntervals();
     botState.connected = false;
     if (bot) {
-      try { bot.end(); } catch (_) {}
+      try {
+        bot.end();
+      } catch (err) {
+        recordError("[FATAL] Error ending bot:", err, "cleanup");
+      }
       bot = null;
     }
     scheduleReconnect();
+  } else {
+    addLog(
+      "[FATAL] Non-network rejection - connection left untouched (see stack above)",
+    );
   }
 });
 

@@ -1,3 +1,5 @@
+const { addLog, addErrorLog, describeError } = require('./logger')
+
 function randomMs(minMs, maxMs) {
     return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs
 }
@@ -18,7 +20,7 @@ function setupLeaveRejoin(bot, createBot) {
         const now = Date.now()
         if (now - lastLogAt >= minGapMs) {
             lastLogAt = now
-            console.log(msg)
+            addLog(msg)
         }
     }
 
@@ -34,9 +36,18 @@ function setupLeaveRejoin(bot, createBot) {
     function scheduleNextJump() {
         if (stopped || !bot.entity) return
 
-        bot.setControlState('jump', true)
+        try {
+            bot.setControlState('jump', true)
+        } catch (e) {
+            addErrorLog('[AFK] Failed to jump:', e)
+            return
+        }
         jumpOffTimer = setTimeout(() => {
-            bot.setControlState('jump', false)
+            try {
+                bot.setControlState('jump', false)
+            } catch (e) {
+                addErrorLog('[AFK] Failed to release jump:', e)
+            }
         }, 300)
 
         // random jump 20s -> 5m
@@ -66,7 +77,7 @@ function setupLeaveRejoin(bot, createBot) {
             try {
                 if (typeof createBot === 'function') createBot()
             } catch (e) {
-                console.log('[AFK] createBot error:', e?.message || e)
+                addErrorLog('[AFK] createBot error:', e)
                 scheduleReconnect('createBot-error')
             }
         }, delay)
@@ -95,7 +106,8 @@ function setupLeaveRejoin(bot, createBot) {
             try {
                 bot.quit()
             } catch (e) {
-                // ignore if already closed
+                // Already closed is fine, but say so rather than hiding it
+                addLog(`[AFK] quit() failed (connection likely already closed): ${describeError(e)}`)
             }
         }, stayTime)
     })
@@ -110,7 +122,8 @@ function setupLeaveRejoin(bot, createBot) {
         cleanup()
     })
 
-    bot.on('error', () => {
+    bot.on('error', (err) => {
+        addErrorLog('[AFK] Bot error - stopping leave/rejoin timers:', err)
         cleanup()
     })
 }
