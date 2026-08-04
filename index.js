@@ -1,13 +1,29 @@
 "use strict";
 
 const { addLog, getLogs } = require("./logger");
+const {
+  jitter,
+  isBotReady,
+  canControl,
+  pulseControl,
+  safeRun,
+  clearTimer,
+  recordError,
+  isNetworkError,
+  httpModuleFor,
+  formatUptime,
+} = require("./botUtils");
+const {
+  escapeHTML,
+  renderPage,
+  BACK_BUTTON_STYLES,
+  BACK_BUTTON_HTML,
+} = require("./webPage");
 const mineflayer = require("mineflayer");
 const { Movements, pathfinder, goals } = require("mineflayer-pathfinder");
 const { GoalBlock } = goals;
 const config = require("./settings.json");
 const express = require("express");
-const http = require("http");
-const https = require("https");
 
 // ============================================================
 // EXPRESS SERVER - Keep Render/Aternos alive
@@ -28,46 +44,20 @@ let botState = {
 
 // Health check endpoint for monitoring
 app.get('/', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html lang="en">
-      <head>
-        <title>${config.name} Dashboard</title>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <link rel="stylesheet" media="print" onload="this.media='all'"
-              href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
-        <style>
-          *, *::before, *::after { box-sizing: border-box; }
-
+  res.send(renderPage({
+    title: `${config.name} Dashboard`,
+    styles: `
           body {
-            font-family: 'Inter', -apple-system, sans-serif;
-            background: #0d1117;
-            color: #e6edf3;
             display: flex;
             justify-content: center;
             align-items: center;
             min-height: 100vh;
-            margin: 0;
             padding: 24px;
           }
 
-          main { width: 100%; max-width: 400px; }
+          main { max-width: 400px; }
 
           header { margin-bottom: 28px; }
-          header h1 {
-            font-size: 26px;
-            font-weight: 700;
-            color: #f0f6fc;
-            margin: 0;
-            line-height: 1.2;
-          }
-          header p {
-            font-size: 14px;
-            color: #8b949e;
-            margin: 6px 0 0;
-            line-height: 1.5;
-          }
 
           .status-section {
             border-radius: 12px;
@@ -135,11 +125,9 @@ app.get('/', (req, res) => {
           }
           .btn-secondary:hover { background: #21262d; color: #c9d1d9; }
 
-          footer { margin-top: 20px; text-align: center; }
-          footer p { font-size: 12px; color: #484f58; margin: 0; }
-        </style>
-      </head>
-      <body>
+          footer { margin-top: 20px; }
+    `,
+    body: `
         <main role="main" aria-label="AFK Bot Dashboard">
 
           <header>
@@ -197,8 +185,8 @@ app.get('/', (req, res) => {
           </footer>
 
         </main>
-
-        <script>
+    `,
+    script: `
           function formatUptime(s) {
             const h = Math.floor(s / 3600);
             const m = Math.floor((s % 3600) / 60);
@@ -259,69 +247,16 @@ app.get('/', (req, res) => {
 
           setInterval(update, 5000);
           update();
-        </script>
-      </body>
-    </html>
-  `);
+    `,
+  }));
 });
 app.get("/tutorial", (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html lang="en">
-      <head>
-        <title>${config.name} - Setup Guide</title>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <link rel="stylesheet" media="print" onload="this.media='all'"
-              href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
-        <style>
-          *, *::before, *::after { box-sizing: border-box; }
+  res.send(renderPage({
+    title: `${config.name} - Setup Guide`,
+    styles: `
+          main { max-width: 560px; }
 
-          body {
-            font-family: 'Inter', -apple-system, sans-serif;
-            background: #0d1117;
-            color: #e6edf3;
-            margin: 0;
-            padding: 40px 24px;
-          }
-
-          main {
-            width: 100%;
-            max-width: 560px;
-            margin: 0 auto;
-          }
-
-          .back-btn {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            font-size: 13px;
-            font-weight: 500;
-            color: #8b949e;
-            text-decoration: none;
-            background: #161b22;
-            border: 1px solid #21262d;
-            border-radius: 8px;
-            padding: 7px 14px;
-            margin-bottom: 32px;
-            transition: color 0.2s, background 0.2s;
-          }
-          .back-btn:hover { background: #21262d; color: #c9d1d9; }
-
-          header { margin-bottom: 32px; }
-          header h1 {
-            font-size: 26px;
-            font-weight: 700;
-            color: #f0f6fc;
-            margin: 0;
-            line-height: 1.2;
-          }
-          header p {
-            font-size: 14px;
-            color: #8b949e;
-            margin: 6px 0 0;
-            line-height: 1.5;
-          }
+          ${BACK_BUTTON_STYLES}
 
           .step-card {
             background: #161b22;
@@ -399,17 +334,10 @@ app.get("/tutorial", (req, res) => {
 
           a { color: #58a6ff; text-decoration: none; }
           a:hover { text-decoration: underline; }
-
-          footer {
-            margin-top: 32px;
-            text-align: center;
-          }
-          footer p { font-size: 12px; color: #484f58; margin: 0; }
-        </style>
-      </head>
-      <body>
+    `,
+    body: `
         <main>
-          <a href="/" class="back-btn">&#8592; Back to Dashboard</a>
+          ${BACK_BUTTON_HTML}
 
           <header>
             <h1>Setup Guide</h1>
@@ -458,9 +386,8 @@ app.get("/tutorial", (req, res) => {
             <p>AFK Bot Dashboard &middot; ${config.name}</p>
           </footer>
         </main>
-      </body>
-    </html>
-  `);
+    `,
+  }));
 });
 
 app.get("/health", (req, res) => {
@@ -479,63 +406,14 @@ app.get("/ping", (req, res) => res.send("pong"));
 app.get("/logs", (req, res) => {
   const logs = getLogs();
 
-  const escapeHTML = (str) =>
-    str.replace(
-      /[&<>"']/g,
-      (m) =>
-        ({
-          "&": "&amp;",
-          "<": "&lt;",
-          ">": "&gt;",
-          '"': "&quot;",
-          "'": "&#39;",
-        })[m],
-    );
-
   const logCount = logs.length;
 
-  res.send(`
-    <!DOCTYPE html>
-    <html lang="en">
-      <head>
-        <title>${config.name} - Logs</title>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <link rel="stylesheet" media="print" onload="this.media='all'"
-              href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
-        <style>
-          *, *::before, *::after { box-sizing: border-box; }
+  res.send(renderPage({
+    title: `${config.name} - Logs`,
+    styles: `
+          main { max-width: 760px; }
 
-          body {
-            font-family: 'Inter', -apple-system, sans-serif;
-            background: #0d1117;
-            color: #e6edf3;
-            margin: 0;
-            padding: 40px 24px;
-          }
-
-          main {
-            width: 100%;
-            max-width: 760px;
-            margin: 0 auto;
-          }
-
-          .back-btn {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            font-size: 13px;
-            font-weight: 500;
-            color: #8b949e;
-            text-decoration: none;
-            background: #161b22;
-            border: 1px solid #21262d;
-            border-radius: 8px;
-            padding: 7px 14px;
-            margin-bottom: 32px;
-            transition: color 0.2s, background 0.2s;
-          }
-          .back-btn:hover { background: #21262d; color: #c9d1d9; }
+          ${BACK_BUTTON_STYLES}
 
           .page-header {
             display: flex;
@@ -735,13 +613,10 @@ app.get("/logs", (req, res) => {
             color: #6e7681;
           }
 
-          footer { margin-top: 32px; text-align: center; }
-          footer p { font-size: 12px; color: #484f58; margin: 0; }
-        </style>
-      </head>
-      <body>
+    `,
+    body: `
         <main>
-          <a href="/" class="back-btn">&#8592; Back to Dashboard</a>
+          ${BACK_BUTTON_HTML}
 
           <div class="page-header">
             <div class="page-header-left">
@@ -799,8 +674,8 @@ app.get("/logs", (req, res) => {
             <p>AFK Bot Dashboard &middot; ${config.name}</p>
           </footer>
         </main>
-
-        <script>
+    `,
+    script: `
           (function() {
             var logBody  = document.getElementById('log-body');
             var input    = document.getElementById('console-input');
@@ -967,10 +842,8 @@ app.get("/logs", (req, res) => {
             scrollBottom();
             scheduleRefresh();
           })();
-        </script>
-      </body>
-    </html>
-  `);
+    `,
+  }));
 });
 
 let botRunning = true;
@@ -1075,14 +948,6 @@ server.on("error", (err) => {
   }
 });
 
-// FIX: only one definition of formatUptime
-function formatUptime(seconds) {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  return `${h}h ${m}m ${s} s`;
-}
-
 // ============================================================
 // SELF-PING - Prevent Render from sleeping
 // FIX: only ping if RENDER_EXTERNAL_URL is set (skip useless localhost ping)
@@ -1098,8 +963,7 @@ function startSelfPing() {
     return;
   }
   setInterval(() => {
-    const protocol = renderUrl.startsWith("https") ? https : http;
-    protocol
+    httpModuleFor(renderUrl)
       .get(`${renderUrl}/ping`, (res) => {
         // Silent success
       })
@@ -1137,14 +1001,8 @@ let connectionTimeoutId = null;
 let isReconnecting = false;
 
 function clearBotTimeouts() {
-  if (reconnectTimeoutId) {
-    clearTimeout(reconnectTimeoutId);
-    reconnectTimeoutId = null;
-  }
-  if (connectionTimeoutId) {
-    clearTimeout(connectionTimeoutId);
-    connectionTimeoutId = null;
-  }
+  reconnectTimeoutId = clearTimer(reconnectTimeoutId);
+  connectionTimeoutId = clearTimer(connectionTimeoutId);
 }
 
 // FIX: Discord rate limiting - track last send time
@@ -1163,10 +1021,27 @@ function addInterval(callback, delay) {
   return id;
 }
 
+// Tracked interval that skips ticks while the bot is unusable and logs throws as "[tag] Error: ..."
+function botInterval(bot, tag, delay, callback, { requireControl = false } = {}) {
+  return addInterval(() => {
+    const ready = requireControl
+      ? canControl(bot, botState)
+      : isBotReady(bot, botState);
+    if (!ready) return;
+    safeRun(tag, callback);
+  }, delay);
+}
+
+function isDiscordEventEnabled(event) {
+  return Boolean(
+    config.discord && config.discord.events && config.discord.events[event],
+  );
+}
+
 function getReconnectDelay() {
   if (botState.wasThrottled) {
     botState.wasThrottled = false;
-    const throttleDelay = 60000 + Math.floor(Math.random() * 60000);
+    const throttleDelay = jitter(60000, 60000);
     addLog(
       `[Bot] Throttle detected - using extended delay: ${throttleDelay / 1000}s`,
     );
@@ -1180,8 +1055,7 @@ function getReconnectDelay() {
     baseDelay * Math.pow(2, botState.reconnectAttempts),
     maxDelay,
   );
-  const jitter = Math.floor(Math.random() * 2000);
-  return delay + jitter;
+  return jitter(delay, 2000);
 }
 
 function createBot() {
@@ -1257,11 +1131,7 @@ function createBot() {
       addLog(
         `[Bot] [+] Successfully spawned on server! (Version: ${bot.version})`,
       );
-      if (
-        config.discord &&
-        config.discord.events &&
-        config.discord.events.connect
-      ) {
+      if (isDiscordEventEnabled("connect")) {
         sendDiscordWebhook(
           `[+] **Connected** to \`${config.server.ip}\``,
           0x4ade80,
@@ -1280,7 +1150,7 @@ function createBot() {
 
       // Attempt creative mode (only works if bot has OP and enabled in settings)
       setTimeout(() => {
-        if (bot && botState.connected && config.server["try-creative"]) {
+        if (isBotReady(bot, botState) && config.server["try-creative"]) {
           bot.chat("/gamemode creative");
           addLog("[INFO] Attempted to set creative mode (requires OP)");
         }
@@ -1304,11 +1174,7 @@ function createBot() {
         typeof reason === "object" ? JSON.stringify(reason) : reason;
       addLog(`[Bot] Kicked: ${kickReason}`);
       botState.connected = false;
-      botState.errors.push({
-        type: "kicked",
-        reason: kickReason,
-        time: Date.now(),
-      });
+      recordError(botState, { type: "kicked", reason: kickReason });
       clearAllIntervals();
 
       const reasonStr = String(kickReason).toLowerCase();
@@ -1323,11 +1189,7 @@ function createBot() {
         botState.wasThrottled = true;
       }
 
-      if (
-        config.discord &&
-        config.discord.events &&
-        config.discord.events.disconnect
-      ) {
+      if (isDiscordEventEnabled("disconnect")) {
         sendDiscordWebhook(`[!] **Kicked**: ${kickReason}`, 0xff0000);
       }
       // NOTE: do NOT call scheduleReconnect() here - 'end' will fire right after 'kicked' and handle it
@@ -1340,11 +1202,7 @@ function createBot() {
       clearAllIntervals();
       spawnHandled = false; // reset for next connection
 
-      if (
-        config.discord &&
-        config.discord.events &&
-        config.discord.events.disconnect
-      ) {
+      if (isDiscordEventEnabled("disconnect")) {
         sendDiscordWebhook(
           `[-] **Disconnected**: ${reason || "Unknown"}`,
           0xf87171,
@@ -1358,7 +1216,7 @@ function createBot() {
     bot.on("error", (err) => {
       const msg = err.message || "";
       addLog(`[Bot] Error: ${msg}`);
-      botState.errors.push({ type: "error", message: msg, time: Date.now() });
+      recordError(botState, { type: "error", message: msg });
       // Don't reconnect on error - let 'end' event handle it
     });
   } catch (err) {
@@ -1385,7 +1243,7 @@ function scheduleReconnect() {
   );
 
   reconnectTimeoutId = setTimeout(() => {
-    reconnectTimeoutId = null;
+    reconnectTimeoutId = clearTimer(reconnectTimeoutId);
     isReconnecting = false;
     createBot();
   }, delay);
@@ -1403,7 +1261,7 @@ function initializeModules(bot, mcData, defaultMove) {
     let authHandled = false;
 
     const tryAuth = (type) => {
-      if (authHandled || !bot || !botState.connected) return;
+      if (authHandled || !isBotReady(bot, botState)) return;
       authHandled = true;
       if (type === "register") {
         bot.chat(`/register ${password} ${password}`);
@@ -1434,7 +1292,7 @@ function initializeModules(bot, mcData, defaultMove) {
 
     // Failsafe: if no prompt after 10s, try login anyway
     setTimeout(() => {
-      if (!authHandled && bot && botState.connected) {
+      if (!authHandled && isBotReady(bot, botState)) {
         addLog(
           "[Auth] No prompt detected after 10s, sending /login as failsafe",
         );
@@ -1449,17 +1307,20 @@ function initializeModules(bot, mcData, defaultMove) {
     const messages = config.utils["chat-messages"].messages;
     if (config.utils["chat-messages"].repeat) {
       let i = 0;
-      addInterval(() => {
-        if (bot && botState.connected) {
+      botInterval(
+        bot,
+        "ChatMessages",
+        config.utils["chat-messages"]["repeat-delay"] * 1000,
+        () => {
           bot.chat(messages[i]);
           botState.lastActivity = Date.now();
           i = (i + 1) % messages.length;
-        }
-      }, config.utils["chat-messages"]["repeat-delay"] * 1000);
+        },
+      );
     } else {
       messages.forEach((msg, idx) => {
         setTimeout(() => {
-          if (bot && botState.connected) bot.chat(msg);
+          if (isBotReady(bot, botState)) bot.chat(msg);
         }, idx * 1000);
       });
     }
@@ -1486,56 +1347,32 @@ function initializeModules(bot, mcData, defaultMove) {
   // ---------- ANTI-AFK ----------
   if (config.utils["anti-afk"] && config.utils["anti-afk"].enabled) {
     // Arm swinging
-    addInterval(
-      () => {
-        if (!bot || !botState.connected) return;
-        try {
-          bot.swingArm();
-        } catch (e) {}
-      },
-      10000 + Math.floor(Math.random() * 50000),
-    );
+    botInterval(bot, "AntiAFK", jitter(10000, 50000), () => {
+      bot.swingArm();
+    });
 
     // Hotbar cycling
-    addInterval(
-      () => {
-        if (!bot || !botState.connected) return;
-        try {
-          const slot = Math.floor(Math.random() * 9);
-          bot.setQuickBarSlot(slot);
-        } catch (e) {}
-      },
-      30000 + Math.floor(Math.random() * 90000),
-    );
+    botInterval(bot, "AntiAFK", jitter(30000, 90000), () => {
+      bot.setQuickBarSlot(Math.floor(Math.random() * 9));
+    });
 
     // Teabagging
-    addInterval(
+    botInterval(
+      bot,
+      "AntiAFK",
+      jitter(120000, 180000),
       () => {
-        if (
-          !bot ||
-          !botState.connected ||
-          typeof bot.setControlState !== "function"
-        )
-          return;
-        if (Math.random() > 0.9) {
-          let count = 2 + Math.floor(Math.random() * 4);
-          const doTeabag = () => {
-            if (count <= 0 || !bot || typeof bot.setControlState !== "function")
-              return;
-            try {
-              bot.setControlState("sneak", true);
-              setTimeout(() => {
-                if (bot && typeof bot.setControlState === "function")
-                  bot.setControlState("sneak", false);
-                count--;
-                setTimeout(doTeabag, 150);
-              }, 150);
-            } catch (e) {}
-          };
-          doTeabag();
-        }
+        if (Math.random() <= 0.9) return;
+        let count = 2 + Math.floor(Math.random() * 4);
+        const doTeabag = () => {
+          if (count <= 0 || !bot) return;
+          pulseControl(bot, "sneak", 150);
+          count--;
+          setTimeout(doTeabag, 300);
+        };
+        doTeabag();
       },
-      120000 + Math.floor(Math.random() * 180000),
+      { requireControl: true },
     );
 
     // FIX: micro-walk only when circle-walk is NOT running, to avoid interrupting pathfinder
@@ -1546,39 +1383,22 @@ function initializeModules(bot, mcData, defaultMove) {
         config.movement["circle-walk"].enabled
       )
     ) {
-      addInterval(
+      botInterval(
+        bot,
+        "AntiAFK",
+        jitter(120000, 360000),
         () => {
-          if (
-            !bot ||
-            !botState.connected ||
-            typeof bot.setControlState !== "function"
-          )
-            return;
-          try {
-            const yaw = Math.random() * Math.PI * 2;
-            bot.look(yaw, 0, true);
-            bot.setControlState("forward", true);
-            setTimeout(
-              () => {
-                if (bot && typeof bot.setControlState === "function")
-                  bot.setControlState("forward", false);
-              },
-              500 + Math.floor(Math.random() * 1500),
-            );
-            botState.lastActivity = Date.now();
-          } catch (e) {
-            addLog("[AntiAFK] Walk error:", e.message);
-          }
+          const yaw = Math.random() * Math.PI * 2;
+          bot.look(yaw, 0, true);
+          pulseControl(bot, "forward", jitter(500, 1500));
+          botState.lastActivity = Date.now();
         },
-        120000 + Math.floor(Math.random() * 360000),
+        { requireControl: true },
       );
     }
 
-    if (config.utils["anti-afk"].sneak) {
-      try {
-        if (typeof bot.setControlState === "function")
-          bot.setControlState("sneak", true);
-      } catch (e) {}
+    if (config.utils["anti-afk"].sneak && canControl(bot, botState)) {
+      safeRun("AntiAFK", () => bot.setControlState("sneak", true));
     }
   }
 
@@ -1637,12 +1457,14 @@ function startCircleWalk(bot, defaultMove) {
   let angle = 0;
   let lastPathTime = 0;
 
-  addInterval(() => {
-    if (!bot || !botState.connected) return;
-    const now = Date.now();
-    if (now - lastPathTime < 2000) return;
-    lastPathTime = now;
-    try {
+  botInterval(
+    bot,
+    "CircleWalk",
+    config.movement["circle-walk"].speed,
+    () => {
+      const now = Date.now();
+      if (now - lastPathTime < 2000) return;
+      lastPathTime = now;
       const x = bot.entity.position.x + Math.cos(angle) * radius;
       const z = bot.entity.position.z + Math.sin(angle) * radius;
       bot.pathfinder.setMovements(defaultMove);
@@ -1655,45 +1477,35 @@ function startCircleWalk(bot, defaultMove) {
       );
       angle += Math.PI / 4;
       botState.lastActivity = Date.now();
-    } catch (e) {
-      addLog("[CircleWalk] Error:", e.message);
-    }
-  }, config.movement["circle-walk"].speed);
+    },
+  );
 }
 
 function startRandomJump(bot) {
-  addInterval(() => {
-    if (
-      !bot ||
-      !botState.connected ||
-      typeof bot.setControlState !== "function"
-    )
-      return;
-    try {
-      bot.setControlState("jump", true);
-      setTimeout(() => {
-        if (bot && typeof bot.setControlState === "function")
-          bot.setControlState("jump", false);
-      }, 300);
+  botInterval(
+    bot,
+    "RandomJump",
+    config.movement["random-jump"].interval,
+    () => {
+      pulseControl(bot, "jump", 300);
       botState.lastActivity = Date.now();
-    } catch (e) {
-      addLog("[RandomJump] Error:", e.message);
-    }
-  }, config.movement["random-jump"].interval);
+    },
+    { requireControl: true },
+  );
 }
 
 function startLookAround(bot) {
-  addInterval(() => {
-    if (!bot || !botState.connected) return;
-    try {
+  botInterval(
+    bot,
+    "LookAround",
+    config.movement["look-around"].interval,
+    () => {
       const yaw = Math.random() * Math.PI * 2 - Math.PI;
       const pitch = (Math.random() * Math.PI) / 2 - Math.PI / 4;
       bot.look(yaw, pitch, false);
       botState.lastActivity = Date.now();
-    } catch (e) {
-      addLog("[LookAround] Error:", e.message);
-    }
-  }, config.movement["look-around"].interval);
+    },
+  );
 }
 
 // ============================================================
@@ -1704,14 +1516,11 @@ function startLookAround(bot) {
 // FIX: e.username only exists on players; use e.name for mobs - now handled properly
 function avoidMobs(bot) {
   const safeDistance = 5;
-  addInterval(() => {
-    if (
-      !bot ||
-      !botState.connected ||
-      typeof bot.setControlState !== "function"
-    )
-      return;
-    try {
+  botInterval(
+    bot,
+    "AvoidMobs",
+    2000,
+    () => {
       const entities = Object.values(bot.entities).filter(
         (e) =>
           e.type === "mob" ||
@@ -1721,18 +1530,13 @@ function avoidMobs(bot) {
         if (!e.position) continue;
         const distance = bot.entity.position.distanceTo(e.position);
         if (distance < safeDistance) {
-          bot.setControlState("back", true);
-          setTimeout(() => {
-            if (bot && typeof bot.setControlState === "function")
-              bot.setControlState("back", false);
-          }, 500);
+          pulseControl(bot, "back", 500);
           break;
         }
       }
-    } catch (e) {
-      addLog("[AvoidMobs] Error:", e.message);
-    }
-  }, 2000);
+    },
+    { requireControl: true },
+  );
 }
 
 // Combat module
@@ -1746,14 +1550,14 @@ function combatModule(bot, mcData) {
 
   // FIX: use physicsTick (not the deprecated physicTick)
   bot.on("physicsTick", () => {
-    if (!bot || !botState.connected) return;
+    if (!isBotReady(bot, botState)) return;
     if (!config.combat["attack-mobs"]) return;
 
     const now = Date.now();
     // FIX: 1.9+ attack cooldown - respect at least 600ms between swings
     if (now - lastAttackTime < 620) return;
 
-    try {
+    safeRun("Combat", () => {
       // FIX: only pick a new target if current one is gone or lock expired
       if (
         lockedTarget &&
@@ -1784,29 +1588,24 @@ function combatModule(bot, mcData) {
         bot.attack(lockedTarget);
         lastAttackTime = now;
       }
-    } catch (e) {
-      addLog("[Combat] Error:", e.message);
-    }
+    });
   });
 
   // FIX: autoEat - check foodPoints property on the item directly (works reliably)
   bot.on("health", () => {
     if (!config.combat["auto-eat"]) return;
-    try {
-      if (bot.food < 14) {
-        const food = bot.inventory
-          .items()
-          .find((i) => i.foodPoints && i.foodPoints > 0);
-        if (food) {
-          bot
-            .equip(food, "hand")
-            .then(() => bot.consume())
-            .catch((e) => addLog("[AutoEat] Error:", e.message));
-        }
+    safeRun("AutoEat", () => {
+      if (bot.food >= 14) return;
+      const food = bot.inventory
+        .items()
+        .find((i) => i.foodPoints && i.foodPoints > 0);
+      if (food) {
+        bot
+          .equip(food, "hand")
+          .then(() => bot.consume())
+          .catch((e) => addLog(`[AutoEat] Error: ${e.message}`));
       }
-    } catch (e) {
-      addLog("[AutoEat] Error:", e.message);
-    }
+    });
   });
 }
 
@@ -1817,7 +1616,7 @@ function bedModule(bot, mcData) {
   let isTryingToSleep = false;
 
   addInterval(async () => {
-    if (!bot || !botState.connected) return;
+    if (!isBotReady(bot, botState)) return;
     if (!config.beds["place-night"]) return; // FIX: check flag (was always skipping before)
 
     try {
@@ -1845,7 +1644,7 @@ function bedModule(bot, mcData) {
       }
     } catch (e) {
       isTryingToSleep = false;
-      addLog("[Bed] Error:", e.message);
+      addLog(`[Bed] Error: ${e.message}`);
     }
   }, 10000);
 }
@@ -1856,14 +1655,9 @@ function chatModule(bot) {
   bot.on("chat", (username, message) => {
     if (!bot || username === bot.username) return;
 
-    try {
+    safeRun("Chat", () => {
       // FIX: send chat events to Discord if enabled
-      if (
-        config.discord &&
-        config.discord.enabled &&
-        config.discord.events &&
-        config.discord.events.chat
-      ) {
+      if (config.discord && config.discord.enabled && isDiscordEventEnabled("chat")) {
         sendDiscordWebhook(`💬 **${username}**: ${message}`, 0x7289da);
       }
 
@@ -1877,9 +1671,7 @@ function chatModule(bot) {
           if (target) bot.chat(`/tp ${target}`);
         }
       }
-    } catch (e) {
-      addLog("[Chat] Error:", e.message);
-    }
+    });
   });
 }
 
@@ -1894,7 +1686,7 @@ const rl = readline.createInterface({
 });
 
 rl.on("line", (line) => {
-  if (!bot || !botState.connected) {
+  if (!isBotReady(bot, botState)) {
     addLog("[Console] Bot not connected");
     return;
   }
@@ -1935,7 +1727,7 @@ function sendDiscordWebhook(content, color = 0x0099ff) {
   }
   lastDiscordSend = now;
 
-  const protocol = config.discord.webhookUrl.startsWith("https") ? https : http;
+  const protocol = httpModuleFor(config.discord.webhookUrl);
   const urlParts = new URL(config.discord.webhookUrl);
 
   const payload = JSON.stringify({
@@ -1981,23 +1773,11 @@ function sendDiscordWebhook(content, color = 0x0099ff) {
 process.on("uncaughtException", (err) => {
   const msg = err.message || "Unknown";
   addLog(`[FATAL] Uncaught Exception: ${msg}`);
-  botState.errors.push({ type: "uncaught", message: msg, time: Date.now() });
+  recordError(botState, { type: "uncaught", message: msg });
 
-  // Cap errors array to prevent memory leak over long uptimes
-  if (botState.errors.length > 100) {
-    botState.errors = botState.errors.slice(-50);
-  }
+  const networkError = isNetworkError(msg);
 
-  const isNetworkError =
-    msg.includes("PartialReadError") ||
-    msg.includes("ECONNRESET") ||
-    msg.includes("EPIPE") ||
-    msg.includes("ETIMEDOUT") ||
-    msg.includes("timed out") ||
-    msg.includes("write after end") ||
-    msg.includes("This socket has been ended");
-
-  if (isNetworkError) {
+  if (networkError) {
     addLog("[FATAL] Known network/protocol error - recovering gracefully...");
   }
 
@@ -2012,37 +1792,23 @@ process.on("uncaughtException", (err) => {
     );
     isReconnecting = false;
     // BUG FIX: was referencing non-existent 'reconnectTimeout' — correct name is 'reconnectTimeoutId'
-    if (reconnectTimeoutId) {
-      clearTimeout(reconnectTimeoutId);
-      reconnectTimeoutId = null;
-    }
+    reconnectTimeoutId = clearTimer(reconnectTimeoutId);
   }
 
   setTimeout(
     () => {
       scheduleReconnect();
     },
-    isNetworkError ? 5000 : 10000,
+    networkError ? 5000 : 10000,
   );
 });
 
 process.on("unhandledRejection", (reason) => {
   const msg = String(reason);
   addLog(`[FATAL] Unhandled Rejection: ${reason}`);
-  botState.errors.push({ type: "rejection", message: msg, time: Date.now() });
-  if (botState.errors.length > 100) {
-    botState.errors = botState.errors.slice(-50);
-  }
+  recordError(botState, { type: "rejection", message: msg });
 
-  const isNetworkError =
-    msg.includes("ETIMEDOUT") ||
-    msg.includes("ECONNRESET") ||
-    msg.includes("EPIPE") ||
-    msg.includes("ENOTFOUND") ||
-    msg.includes("timed out") ||
-    msg.includes("PartialReadError");
-
-  if (isNetworkError && !isReconnecting) {
+  if (isNetworkError(msg) && !isReconnecting) {
     addLog("[FATAL] Network rejection — triggering reconnect...");
     clearAllIntervals();
     botState.connected = false;
